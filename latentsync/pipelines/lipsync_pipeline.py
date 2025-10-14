@@ -329,6 +329,7 @@ class LipsyncPipeline(DiffusionPipeline):
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: Optional[int] = 1,
+        sync_to: str = "audio",
         **kwargs,
     ):
         is_train = self.unet.training
@@ -362,12 +363,49 @@ class LipsyncPipeline(DiffusionPipeline):
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
         whisper_feature = self.audio_encoder.audio2feat(audio_path)
-        whisper_chunks = self.audio_encoder.feature2chunks(feature_array=whisper_feature, fps=video_fps)
+        # whisper_chunks = self.audio_encoder.feature2chunks(feature_array=whisper_feature, fps=video_fps)
 
         audio_samples = read_audio(audio_path)
         video_frames = read_video(video_path, use_decord=False)
 
-        video_frames, faces, boxes, affine_matrices = self.loop_video(whisper_chunks, video_frames)
+
+        n_video_frames = len(video_frames)
+
+        # frames sync instead of audio
+        if sync_to == "video":
+            # 1) Make chunks at the target fps
+            whisper_chunks = self.audio_encoder.feature2chunks(
+                feature_array=whisper_feature,
+                fps=video_fps
+            )
+
+            # 2) Do NOT loop/extend video; we keep video length as ground truth
+            #    Adjust chunks length to match video length:
+            if len(whisper_chunks) < n_video_frames:
+                # pad by repeating the last chunk
+                if len(whisper_chunks) == 0:
+                    raise RuntimeError("No whisper chunks produced; check audio/feature settings.")
+                last = whisper_chunks[-1]
+                pad = [last.clone() for _ in range(n_video_frames - len(whisper_chunks))]
+                whisper_chunks = whisper_chunks + pad
+            else:
+                whisper_chunks = whisper_chunks[:n_video_frames]
+
+            # 3) Prepare faces/boxes/affines directly from the original video (no looping)
+            faces, boxes, affine_matrices = self.affine_transform_video(video_frames)
+
+        else:
+            # Original behavior: drive timeline by audio length (may loop/ping-pong the video)
+            whisper_chunks = self.audio_encoder.feature2chunks(
+                feature_array=whisper_feature,
+                fps=video_fps
+            )
+            video_frames, faces, boxes, affine_matrices = self.loop_video(whisper_chunks, video_frames)
+            n_video_frames = len(video_frames)
+
+        # video_frames, faces, boxes, affine_matrices = self.loop_video(whisper_chunks, video_frames)
+
+
 
         synced_video_frames = []
 
@@ -459,8 +497,19 @@ class LipsyncPipeline(DiffusionPipeline):
 
         synced_video_frames = self.restore_video(torch.cat(synced_video_frames), video_frames, boxes, affine_matrices)
 
-        audio_samples_remain_length = int(synced_video_frames.shape[0] / video_fps * audio_sample_rate)
+
+        # --- Duration lock: base on VIDEO ---
+        if sync_to == "video":
+            # Length from the video timeline
+            audio_samples_remain_length = int(n_video_frames / video_fps * audio_sample_rate)
+        else:
+            # Original behavior (audio-driven)
+            audio_samples_remain_length = int(
+                len(synced_video_frames) / video_fps * audio_sample_rate
+            )
+
         audio_samples = audio_samples[:audio_samples_remain_length].cpu().numpy()
+
 
         if is_train:
             self.unet.train()
